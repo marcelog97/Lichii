@@ -283,14 +283,20 @@ std::optional<VideoCore::RasterizerDownloadArea> BufferCache<P>::GetFlushArea(DA
     area->preemtive = !IsRegionGpuModified(device_addr_start_aligned,
                                            device_addr_end_aligned - device_addr_start_aligned);
     // A preflushable mark persists and downloads later GPU writes at every fence. Native titles
-    // instead keep read traps and flush on demand. EDEN_NX2_PREFLUSH=1/0 forces either.
+    // instead keep read traps and flush on demand, except Ocarina: its CPU reads the output of
+    // ~30 compute storage buffers every frame, and even batched (DownloadMemory) that took ~200
+    // full Finishes a second (34.2 FPS at the Kokiri autosave; preflushed 37.6, the same picture,
+    // and the marked set stays ~100 64 KiB regions while walking). EDEN_NX2_PREFLUSH=1/0 forces
+    // either.
     static const int forced_preflush = [] {
         const char* value = std::getenv("EDEN_NX2_PREFLUSH");
         return value == nullptr ? -1 : (value[0] == '1' ? 1 : 0);
     }();
     const bool preflush = forced_preflush >= 0
                               ? forced_preflush == 1
-                              : !Tegra::g_nx2_ampere.load(std::memory_order_relaxed);
+                              : !Tegra::g_nx2_ampere.load(std::memory_order_relaxed) ||
+                                    Tegra::g_nx2_program_id.load(std::memory_order_relaxed) ==
+                                        Tegra::OcarinaOfTimeProgramId;
     if (!area->preemtive) {
         if (Nx2DownloadTrace::g_enabled) [[unlikely]] {
             Nx2DownloadTrace::Marked(device_addr_start_aligned,

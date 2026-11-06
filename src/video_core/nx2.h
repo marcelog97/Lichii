@@ -20,6 +20,11 @@ namespace Tegra {
 // Ampere classes and the Turing+ macro ISA, which Eden's Maxwell engines don't implement.
 inline std::atomic<bool> g_nx2_ampere{false};
 
+// Program id of the application whose Switch 2 driver set g_nx2_ampere (0 before), for the
+// few per-title defaults in video_core.
+inline std::atomic<u64> g_nx2_program_id{0};
+inline constexpr u64 OcarinaOfTimeProgramId = 0x0400486024DEC000ULL;
+
 // Device pages the GPU has written through the buffer cache (shader stores, copies), ever. Title 1
 // runs command lists the GPU writes each frame (20-byte entries its culling fills in); read
 // without a flush they are stale and the draws behind them (trees) go missing. The bits never
