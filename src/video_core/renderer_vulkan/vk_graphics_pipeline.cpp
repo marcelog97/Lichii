@@ -1254,6 +1254,15 @@ void GraphicsPipeline::MakePipeline(VkRenderPass render_pass) {
     if (uses_descriptor_buffer) {
         flags |= VK_PIPELINE_CREATE_DESCRIPTOR_BUFFER_BIT_EXT;
     }
+    // EDEN_NX2_PIPELINE_NO_OPT=1 asks the driver not to optimize (measurement switch: how much of a
+    // first-time compile is optimization; the shaders then run slower).
+    static const bool no_optimization = [] {
+        const char* value = std::getenv("EDEN_NX2_PIPELINE_NO_OPT");
+        return value != nullptr && value[0] == '1';
+    }();
+    if (no_optimization) {
+        flags |= VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT;
+    }
 
     pipeline = device.GetLogical().CreateGraphicsPipeline({
         .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,

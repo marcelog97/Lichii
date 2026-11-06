@@ -1022,6 +1022,7 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
         });
         ++state.total;
     }};
+    const auto preload_begin = std::chrono::steady_clock::now();
     VideoCommon::LoadPipelines(stop_loading, pipeline_cache_filename, CACHE_VERSION, load_compute,
                                load_graphics);
 
@@ -1039,6 +1040,27 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
     lock.unlock();
 
     workers.WaitForRequests(stop_loading);
+    LOG_INFO(Render_Vulkan, "Built {} cached pipelines at boot in {:.2f} s", state.total,
+             std::chrono::duration<double>(std::chrono::steady_clock::now() - preload_begin).count());
+    // EDEN_NX2_EXIT_AFTER_S=<seconds> quits that long after the boot preload (unattended tests).
+    if (const char* value = std::getenv("EDEN_NX2_EXIT_AFTER_S");
+        value != nullptr && std::atoi(value) > 0) {
+        const int seconds = std::atoi(value);
+        std::thread([seconds] {
+            std::this_thread::sleep_for(std::chrono::seconds{seconds});
+            LOG_INFO(Render_Vulkan, "Exiting {} s after the boot preload (EDEN_NX2_EXIT_AFTER_S)",
+                     seconds);
+            std::this_thread::sleep_for(std::chrono::seconds{2});
+            std::_Exit(0);
+        }).detach();
+    }
+    // EDEN_NX2_EXIT_AFTER_PRELOAD=1 quits right here, before the game runs (measurement boots).
+    if (const char* value = std::getenv("EDEN_NX2_EXIT_AFTER_PRELOAD");
+        value != nullptr && value[0] == '1') {
+        LOG_INFO(Render_Vulkan, "Exiting after the boot preload (EDEN_NX2_EXIT_AFTER_PRELOAD)");
+        std::this_thread::sleep_for(std::chrono::seconds{2}); // lets the logger write the lines
+        std::_Exit(0);
+    }
 
     if (use_vulkan_pipeline_cache) {
         SerializeVulkanPipelineCache(vulkan_pipeline_cache_filename, vulkan_pipeline_cache,
@@ -1228,14 +1250,47 @@ GraphicsPipeline* PipelineCache::BuiltPipeline(GraphicsPipeline* pipeline) const
     if (pipeline->IsBuilt()) {
         return pipeline;
     }
-    if (!use_asynchronous_shaders) {
+    // EDEN_NX2_ASYNC_DISCARD=1 (from zortos293/Lichii#224): a native draw whose pipeline is still
+    // building may be skipped instead of stalling the frame, under the legacy async heuristic and
+    // without the async-shaders setting. A new pipeline first gets EDEN_NX2_ASYNC_GRACE_MS
+    // (default 12) to finish, once, so a driver-cache hit (2-9 ms) never skips; first-time driver
+    // compiles (0.1-2.6 s on Ocarina, ~0.6 s on average) do. Pipelines that write storage memory
+    // and mesh pipelines always wait: what they produce can persist.
+    static const bool discard_native = [] {
+        const char* value = std::getenv("EDEN_NX2_ASYNC_DISCARD");
+        const bool enabled = value != nullptr && value[0] == '1';
+        if (enabled) {
+            LOG_INFO(Render_Vulkan, "EDEN_NX2_ASYNC_DISCARD: native draws skip pipelines still "
+                                    "building after a short grace");
+        }
+        return enabled;
+    }();
+    static const std::chrono::milliseconds grace = [] {
+        const char* value = std::getenv("EDEN_NX2_ASYNC_GRACE_MS");
+        return std::chrono::milliseconds{value != nullptr ? std::atoi(value) : 12};
+    }();
+    const bool native = maxwell3d->GetNativeMacroEngine().native_turing;
+    if (!use_asynchronous_shaders && !(native && discard_native)) {
         return pipeline;
     }
     const auto& draw_state = maxwell3d->draw_manager.draw_state;
-    const bool discard = CanDiscardPendingDraw(maxwell3d->GetNativeMacroEngine().native_turing,
-                                              maxwell3d->regs.zeta_enable != 0,
-                                              draw_state.draw_element_count,
-                                              draw_state.draw_element_count);
+    bool discard = CanDiscardPendingDraw(native, maxwell3d->regs.zeta_enable != 0,
+                                         draw_state.draw_element_count,
+                                         draw_state.draw_element_count, discard_native);
+    if (discard && native) {
+        if (pipeline->WritesStorage() || pipeline->IsMeshPipeline() ||
+            pipeline->WaitBuiltOnce(grace)) {
+            discard = false;
+        }
+    }
+    if (discard) {
+        static std::atomic<u64> skipped{};
+        if ((skipped.fetch_add(1, std::memory_order_relaxed) & 255) == 0) {
+            // Counts lookups, not draws: a draw can look its pipeline up more than once.
+            LOG_INFO(Render_Vulkan, "Async shaders: {} pipeline lookups skipped for unbuilt pipelines",
+                     skipped.load(std::memory_order_relaxed));
+        }
+    }
     return discard ? nullptr : pipeline;
 }
 

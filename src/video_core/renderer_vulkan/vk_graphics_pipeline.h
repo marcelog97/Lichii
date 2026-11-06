@@ -165,6 +165,20 @@ public:
         return build->IsBuilt();
     }
 
+    /// The first call waits up to `timeout` for the build (EDEN_NX2_ASYNC_DISCARD's grace); later
+    /// calls only report whether it is built, so a frame never waits twice for one pipeline.
+    [[nodiscard]] bool WaitBuiltOnce(std::chrono::milliseconds timeout) const {
+        if (async_grace_spent.exchange(true, std::memory_order_relaxed)) {
+            return IsBuilt();
+        }
+        return build->WaitFor(timeout);
+    }
+
+    /// The pipeline writes storage buffers or images: what it produces can persist.
+    [[nodiscard]] bool WritesStorage() const noexcept {
+        return writes_storage;
+    }
+
     [[nodiscard]] bool Failed() const noexcept {
         return build->Failed();
     }
@@ -235,6 +249,7 @@ private:
     bool uses_push_descriptor{false};
     bool uses_descriptor_buffer{false};
     std::optional<PipelineBuild> build;
+    mutable std::atomic_bool async_grace_spent{};
 };
 
 } // namespace Vulkan
