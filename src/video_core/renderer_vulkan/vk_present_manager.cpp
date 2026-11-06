@@ -4,6 +4,8 @@
 // SPDX-FileCopyrightText: Copyright 2023 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstdlib>
+
 #include "common/settings.h"
 #include "common/thread.h"
 #include "core/frontend/emu_window.h"
@@ -129,7 +131,12 @@ PresentManager::PresentManager(const vk::Instance& instance_,
     , surface{surface_}
     , blit_supported{CanBlitToSwapchain(device.GetPhysical(), swapchain.GetImageViewFormat())}
     , storage_supported{CanStoreToFrame(device.GetPhysical(), swapchain.GetImageFormat())}
-    , use_present_thread{Settings::values.async_presentation.GetValue()}
+    // EDEN_NX2_ASYNC_PRESENT=0/1 overrides the setting (A/B runs).
+    , use_present_thread{[] {
+        const char* value = std::getenv("EDEN_NX2_ASYNC_PRESENT");
+        return value != nullptr ? value[0] == '1'
+                                : Settings::values.async_presentation.GetValue();
+    }()}
 {
     SetImageCount();
 
