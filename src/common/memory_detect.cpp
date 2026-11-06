@@ -4,6 +4,7 @@
 #ifdef _WIN32
 // clang-format off
 #include <windows.h>
+#include <psapi.h>
 #include <sysinfoapi.h>
 // clang-format on
 #else
@@ -20,6 +21,16 @@
 #include "common/memory_detect.h"
 
 namespace Common {
+
+u64 GetProcessPageFaultCount() {
+#ifdef _WIN32
+    PROCESS_MEMORY_COUNTERS counters{};
+    if (GetProcessMemoryInfo(GetCurrentProcess(), &counters, sizeof(counters))) {
+        return counters.PageFaultCount;
+    }
+#endif
+    return 0;
+}
 
 // Detects the RAM and Swapfile sizes
 static MemoryInfo Detect() {

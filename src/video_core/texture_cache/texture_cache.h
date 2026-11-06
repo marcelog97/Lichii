@@ -7,6 +7,7 @@
 #pragma once
 
 #include <algorithm>
+#include <chrono>
 #include <numeric>
 #include <cstdlib>
 #include <limits>
@@ -132,6 +133,9 @@ TextureCache<P>::TextureCache(Runtime& runtime_, Tegra::MaxwellDeviceMemoryManag
 
 template <class P>
 void TextureCache<P>::RunGarbageCollector() {
+    const auto gc_begin = std::chrono::steady_clock::now();
+    const u64 downloads_before = gc_download_deletes;
+    const u64 deletes_before = gc_deletes + gc_costly_deletes;
     bool high_priority_mode = false;
     bool aggressive_mode = false;
     bool evict_old_costly = false;
@@ -252,6 +256,18 @@ void TextureCache<P>::RunGarbageCollector() {
     if (total_used_memory >= critical_memory) {
         Configure(true);
         Collect();
+    }
+    // Names the frames the collector stalls: each GPU-written image it evicts is downloaded
+    // first, with a Finish of its own.
+    const auto gc_elapsed = std::chrono::steady_clock::now() - gc_begin;
+    if (gc_elapsed > std::chrono::milliseconds{10}) {
+        LOG_INFO(HW_GPU,
+                 "Nx2Perf hitch: texture collector took {:.1f} ms: {} downloads with a Finish "
+                 "each, {} images deleted ({} MiB in use, expected {} MiB, critical {} MiB)",
+                 std::chrono::duration<double, std::milli>(gc_elapsed).count(),
+                 gc_download_deletes - downloads_before,
+                 gc_deletes + gc_costly_deletes - deletes_before, total_used_memory >> 20,
+                 expected_memory >> 20, critical_memory >> 20);
     }
 }
 

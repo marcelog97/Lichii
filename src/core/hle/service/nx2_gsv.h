@@ -29,6 +29,7 @@
 #include "common/div_ceil.h"
 #include "common/dkb_frame_trace.h"
 #include "common/game_presets.h"
+#include "common/memory_detect.h"
 #include "common/settings.h"
 #include "common/thread.h"
 #include "core/core.h"
@@ -1841,12 +1842,21 @@ private:
                 !system.Host1x().GetSyncpointManager().IsReadyGuest(fence_id, w[24])) {
                 ++m_stats.ran_ahead;
             }
+            const u64 page_faults = Common::GetProcessPageFaultCount();
             if (m_stats.last_present != std::chrono::steady_clock::time_point{}) {
                 const long long frame = to_us(entered - m_stats.last_present);
                 m_stats.frame_us += frame;
                 m_stats.max_frame_us = (std::max)(m_stats.max_frame_us, frame);
                 m_stats.hitches += frame > 100'000 ? 1 : 0;
+                // Names the long frames: thousands of page faults since the previous present
+                // point at host paging rather than at the emulator.
+                if (frame > 100'000) {
+                    LOG_INFO(Service,
+                             "nx2:vi2 long frame: {} ms, {} page faults since the previous present",
+                             frame / 1000, page_faults - m_last_page_faults);
+                }
             }
+            m_last_page_faults = page_faults;
             m_stats.last_present = entered;
             if (++m_stats.presents == 600) {
                 LOG_INFO(Service,
@@ -1876,6 +1886,7 @@ private:
         u32 presents{}, ran_ahead{};
         std::chrono::steady_clock::time_point last_present{};
     } m_stats{};
+    u64 m_last_page_faults{};
     u32 m_previous_fence_id{~0U}; // none yet (WaitForFrame ignores ids >= 192)
     u32 m_previous_fence_value{};
 
