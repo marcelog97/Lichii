@@ -29,8 +29,12 @@ struct Totals {
 struct State {
     std::unordered_map<u64, Totals> writes;  ///< (address << 24 | size) of the GPU write
     std::unordered_map<u64, Totals> regions; ///< 64 KiB region copied back
+    std::unordered_map<u64, Totals> flushed_reads; ///< 64 KiB region of CPU reads that flushed
     std::chrono::steady_clock::time_point last{std::chrono::steady_clock::now()};
     u64 marks{};
+    u64 reads_flushed{};
+    u64 reads_marked{};
+    u64 read_bytes_flushed{};
 };
 
 inline State& Get() {
@@ -67,10 +71,19 @@ inline void MaybeReport() {
         return;
     }
     state.last = now;
+    LOG_INFO(HW_GPU,
+             "Download trace, CPU reads of GPU-written memory in 10 s: {} flushed ({} KiB), {} "
+             "marked preflushable",
+             state.reads_flushed, state.read_bytes_flushed / 1024, state.reads_marked);
+    LogTop("flushed CPU reads by region", state.flushed_reads, false);
     LogTop("queued by GPU write", state.writes, true);
     LogTop("copied back by region", state.regions, false);
     state.writes.clear();
     state.regions.clear();
+    state.flushed_reads.clear();
+    state.reads_flushed = 0;
+    state.reads_marked = 0;
+    state.read_bytes_flushed = 0;
 }
 
 /// A GPU write over [address, address + size) queued `queued` bytes for the next fence.
@@ -90,10 +103,22 @@ inline void Copied(u64 address, u64 size) {
 
 /// A guest CPU read of GPU-written [address, address + size): marked Preflushable, or flushed.
 inline void Marked(u64 address, u64 size, bool preflush) {
-    if (Get().marks++ < 2000) {
+    auto& state = Get();
+    if (state.marks++ < 2000) {
         LOG_INFO(HW_GPU, "Download trace: CPU read of GPU-written [{:#x} +{:#x}) {}", address,
                  size, preflush ? "marked preflushable" : "flushed");
     }
+    if (preflush) {
+        ++state.reads_marked;
+    } else {
+        ++state.reads_flushed;
+        state.read_bytes_flushed += size;
+        auto& totals = state.flushed_reads[address >> 16];
+        totals.bytes += size;
+        ++totals.count;
+    }
+    // With fence downloads off (Switch 2 titles) Copied never runs: report from here too.
+    MaybeReport();
 }
 
 } // namespace VideoCommon::Nx2DownloadTrace
