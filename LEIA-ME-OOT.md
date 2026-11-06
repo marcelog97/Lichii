@@ -24,14 +24,15 @@ Juntos, esses ajustes levaram o autosave da floresta Kokiri de ~33 para ~41 fps,
 | Nunca descarta pipelines e monta todo o cache de pipelines na abertura | `EDEN_NX2_PIPELINE_EVICT_FRAMES=9000` e `EDEN_NX2_PRELOAD_ALL_PIPELINES=0` | Acabou com as rajadas de remontagem: eram 48 dos 51 engasgos de uma sessão de 25 min |
 | Só marca memória como "fria" (tira páginas da RAM do processo) quando há menos de 2 GB disponíveis (vale para todos os jogos) | `EDEN_NX2_HINT_COLD=1` | Evita quadros de até 0,5 s com dezenas de milhares de faltas de página quando sobra RAM |
 
-### Opcional: não travar na primeira vez que algo aparece
+### Não travar na primeira vez que algo aparece (ligado por padrão no Ocarina)
 
-`EDEN_NX2_ASYNC_DISCARD=1` vem do PR #224 do projeto oficial, com três acréscimos daqui:
+O pulo vem do PR #224 do projeto oficial (`EDEN_NX2_ASYNC_DISCARD`), com quatro acréscimos daqui:
+- vem ligado por padrão no Ocarina, sem precisar da opção de shaders assíncronos da interface; `EDEN_NX2_ASYNC_DISCARD=0` desliga;
 - dá até 12 ms para o pipeline terminar antes de pular (`EDEN_NX2_ASYNC_GRACE_MS`), então o que já está no cache da placa nunca é pulado;
 - pula só desenhos 3D com teste de profundidade, porque pular desenhos de interface deixava o minimapa vazio;
 - nunca pula pipelines que gravam em memória nem pipelines de malha.
 
-Com ele, quando a placa compila algo pela primeira vez (0,1 a 2,6 s), o objeto some por alguns quadros em vez de travar a imagem. Na primeira visita a uma área, com os caches vazios, os quadros acima de 100 ms caíram de 78,6 para 36,8 a cada 10 minutos. Recomendado na primeira jogatina. Vem desligado.
+Com ele, quando a placa compila algo pela primeira vez (0,1 a 2,6 s), o objeto some por alguns quadros em vez de travar a imagem. Na primeira visita a uma área, com os caches vazios, os quadros acima de 100 ms caíram de 78,6 para 36,8 a cada 10 minutos, e nenhuma captura mostrou defeito. O log da abertura confirma que ele está ligado: "Native draws skip pipelines still building after 12 ms".
 
 ### Outros
 
@@ -70,10 +71,10 @@ Para outras plataformas, veja `docs/Build.md`.
 
 1. Abra o `lichii.exe` e aponte a pasta de jogos para onde está o seu `.nup`.
 2. Nas configurações do jogo, deixe a precisão da GPU (*GPU Accuracy*) em **Fast**.
-3. Para não travar quando algo novo aparece (recomendado na primeira jogatina):
+3. O pulo de compilação já vem ligado. Para desligá-lo e sempre esperar a compilação:
 
    ```powershell
-   $env:EDEN_NX2_ASYNC_DISCARD = '1'; .\build\oot\bin\lichii.exe
+   $env:EDEN_NX2_ASYNC_DISCARD = '0'; .\build\oot\bin\lichii.exe
    ```
 
 4. Em notebook com Intel e NVIDIA, vá em Configurações › Sistema › Tela › Gráficos e escolha **Alto desempenho** para o `lichii.exe`. Sem isso, o Vulkan pode usar a Intel.
