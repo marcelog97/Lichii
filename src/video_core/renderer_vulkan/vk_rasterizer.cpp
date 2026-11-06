@@ -63,6 +63,7 @@
 #include "video_core/vulkan_common/vulkan_wrapper.h"
 #include "video_core/memory_manager.h"
 #include "video_core/nx2_debug_control.h"
+#include "video_core/nx2_churn_trace.h"
 #include "video_core/nx2_profile.h"
 
 namespace Vulkan {
@@ -1646,6 +1647,11 @@ void RasterizerVulkan::InnerInvalidation(std::span<const std::pair<DAddr, std::s
     if (Settings::values.skip_cpu_inner_invalidation.GetValue()) {
         return;
     }
+    if (VideoCommon::Nx2ChurnTrace::g_enabled) [[unlikely]] {
+        for (const auto& [addr, size] : sequences) {
+            VideoCommon::Nx2ChurnTrace::Note(VideoCommon::Nx2ChurnTrace::Inner, addr, size);
+        }
+    }
     {
         std::scoped_lock lock{texture_cache.mutex};
         for (const auto& [addr, size] : sequences) {
@@ -1683,6 +1689,9 @@ bool RasterizerVulkan::OnCPUWrite(DAddr addr, u64 size) {
 void RasterizerVulkan::OnCacheInvalidation(DAddr addr, u64 size) {
     if (addr == 0 || size == 0) {
         return;
+    }
+    if (VideoCommon::Nx2ChurnTrace::g_enabled) [[unlikely]] {
+        VideoCommon::Nx2ChurnTrace::Note(VideoCommon::Nx2ChurnTrace::CpuWrite, addr, size);
     }
 
     {
