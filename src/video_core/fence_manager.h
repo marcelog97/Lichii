@@ -26,6 +26,7 @@
 #include "video_core/gpu.h"
 #include "video_core/host1x/host1x.h"
 #include "video_core/host1x/syncpoint_manager.h"
+#include "video_core/nx2.h"
 #include "video_core/nx2_profile.h"
 #include "video_core/rasterizer_interface.h"
 
@@ -397,13 +398,21 @@ private:
     /// fast GPU fences the guest sees a fence's operation when it is signalled, before the host
     /// GPU runs the work and before its downloads land, so downloading for every fence only
     /// makes the copies younger: Ocarina signals ~230 fences a frame and each copied the same
-    /// preflushed pages back again (~1 GB/s). EDEN_NX2_DOWNLOAD_BATCH_US=<us>: with fast fences,
-    /// commit downloads at most once per interval; the ranges written meanwhile merge.
+    /// preflushed pages back again (~1 GB/s). With fast fences Ocarina commits downloads at most
+    /// once a millisecond and the ranges written meanwhile merge: ~110 MB/s copied back, 38.6 ->
+    /// 40.0 FPS (A/B, three runs each). EDEN_NX2_DOWNLOAD_BATCH_US=<us> sets the interval for any
+    /// title (0 = every fence).
     bool CommitBufferDownloadsNow(bool delay_fence) {
-        static const s64 interval_ns = [] {
+        static const s64 forced_ns = [] {
             const char* value = std::getenv("EDEN_NX2_DOWNLOAD_BATCH_US");
-            return value == nullptr ? s64{0} : s64{std::atoll(value)} * 1000;
+            return value == nullptr ? s64{-1} : s64{std::atoll(value)} * 1000;
         }();
+        const s64 interval_ns =
+            forced_ns >= 0 ? forced_ns
+            : Tegra::g_nx2_program_id.load(std::memory_order_relaxed) ==
+                      Tegra::OcarinaOfTimeProgramId
+                ? s64{1'000'000}
+                : s64{0};
         if (delay_fence || interval_ns <= 0) {
             return true;
         }
