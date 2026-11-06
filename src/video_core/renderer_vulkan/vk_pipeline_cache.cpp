@@ -734,6 +734,31 @@ bool PreloadAllPipelines(u64 title_id) {
     return title_id == Tegra::OcarinaOfTimeProgramId;
 }
 
+// Native draws skip pipelines still building (after AsyncDiscardGrace) instead of stalling the
+// frame. On by default for Ocarina, where first-time driver compiles took 0.1-2.6 s (~0.6 s on
+// average) and a first visit with empty caches went from 78.6 to 36.8 frames over 100 ms per 10
+// minutes, with every capture intact. EDEN_NX2_ASYNC_DISCARD=1/0 forces it for any title.
+bool AsyncDiscardNative(u64 program_id) {
+    static const int forced = [] {
+        const char* value = std::getenv("EDEN_NX2_ASYNC_DISCARD");
+        return value == nullptr ? -1 : (value[0] == '1' ? 1 : 0);
+    }();
+    if (forced >= 0) {
+        return forced == 1;
+    }
+    return program_id == Tegra::OcarinaOfTimeProgramId;
+}
+
+// What a new pipeline gets to finish before its draws skip, once: a driver-cache hit (2-9 ms)
+// never skips. EDEN_NX2_ASYNC_GRACE_MS sets it (default 12).
+std::chrono::milliseconds AsyncDiscardGrace() {
+    static const std::chrono::milliseconds grace = [] {
+        const char* value = std::getenv("EDEN_NX2_ASYNC_GRACE_MS");
+        return std::chrono::milliseconds{value != nullptr ? std::atoi(value) : 12};
+    }();
+    return grace;
+}
+
 // Frames a graphics pipeline may go unused before it is destroyed (0 = never). Ocarina keeps all:
 // returning to an area rebuilt the evicted ones in bursts of 100-400 on the GPU thread, each a
 // shader translation (median 4.9 ms) plus the driver build, which made 48 of the 51 hitches over
@@ -1043,6 +1068,12 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
     workers.WaitForRequests(stop_loading);
     LOG_INFO(Render_Vulkan, "Built {} cached pipelines at boot in {:.2f} s", state.total,
              std::chrono::duration<double>(std::chrono::steady_clock::now() - preload_begin).count());
+    if (AsyncDiscardNative(title_id)) {
+        LOG_INFO(Render_Vulkan,
+                 "Native draws skip pipelines still building after {} ms "
+                 "(EDEN_NX2_ASYNC_DISCARD=0 turns it off)",
+                 AsyncDiscardGrace().count());
+    }
     // EDEN_NX2_EXIT_AFTER_S=<seconds> quits that long after the boot preload (unattended tests).
     if (const char* value = std::getenv("EDEN_NX2_EXIT_AFTER_S");
         value != nullptr && std::atoi(value) > 0) {
@@ -1254,25 +1285,15 @@ GraphicsPipeline* PipelineCache::BuiltPipeline(GraphicsPipeline* pipeline) const
     if (pipeline->IsBuilt()) {
         return pipeline;
     }
-    // EDEN_NX2_ASYNC_DISCARD=1 (zortos293/Lichii#224): a native draw whose pipeline is still
-    // building may be skipped instead of stalling the frame. Local additions: it works without the
-    // async-shaders setting; a new pipeline first gets EDEN_NX2_ASYNC_GRACE_MS (default 12) to
-    // finish, once, so a driver-cache hit (2-9 ms) never skips and only first-time driver compiles
-    // (0.1-2.6 s on Ocarina, ~0.6 s on average) do; pipelines that write storage memory and mesh
-    // pipelines always wait; and native draws skip only when depth-tested (async_draw_policy.h).
-    static const bool discard_native = [] {
-        const char* value = std::getenv("EDEN_NX2_ASYNC_DISCARD");
-        const bool enabled = value != nullptr && value[0] == '1';
-        if (enabled) {
-            LOG_INFO(Render_Vulkan, "EDEN_NX2_ASYNC_DISCARD: native draws skip pipelines still "
-                                    "building after a short grace");
-        }
-        return enabled;
-    }();
-    static const std::chrono::milliseconds grace = [] {
-        const char* value = std::getenv("EDEN_NX2_ASYNC_GRACE_MS");
-        return std::chrono::milliseconds{value != nullptr ? std::atoi(value) : 12};
-    }();
+    // EDEN_NX2_ASYNC_DISCARD (zortos293/Lichii#224): a native draw whose pipeline is still
+    // building may be skipped instead of stalling the frame. Local additions: on by default for
+    // Ocarina (AsyncDiscardNative) and without the async-shaders setting; a new pipeline first gets
+    // AsyncDiscardGrace to finish, once, so only first-time driver compiles skip; pipelines that
+    // write storage memory and mesh pipelines always wait; and native draws skip only when
+    // depth-tested (async_draw_policy.h).
+    const bool discard_native =
+        AsyncDiscardNative(Tegra::g_nx2_program_id.load(std::memory_order_relaxed));
+    const std::chrono::milliseconds grace = AsyncDiscardGrace();
     const bool native = maxwell3d->GetNativeMacroEngine().native_turing;
     if (!use_asynchronous_shaders && !(native && discard_native)) {
         return pipeline;
