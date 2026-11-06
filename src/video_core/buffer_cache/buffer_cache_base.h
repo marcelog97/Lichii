@@ -685,16 +685,30 @@ private:
         }
         const DAddr end = device_addr + size;
         u64 queued = 0;
+        // The preflushable pages are downloaded at fences and their reads never flush: trap only
+        // the pages between them. A trap over them only made every guest read of a preflushed
+        // page fault once per GPU write (and the write protect it again).
+        // EDEN_NX2_TRAP_PREFLUSHED=1 traps the whole write again, as before.
+        static const bool trap_preflushed = std::getenv("EDEN_NX2_TRAP_PREFLUSHED") != nullptr;
+        DAddr untrapped = device_addr;
         memory_tracker.ForEachPreflushableRange(device_addr, size, [&](DAddr begin, u64 length) {
             const DAddr lower = (std::max)(begin, device_addr);
             const DAddr upper = (std::min)(begin + length, end);
             if (lower < upper) {
                 uncommitted_gpu_modified_ranges.Add(lower, upper - lower);
                 queued += upper - lower;
+                if (!trap_preflushed && untrapped < lower) {
+                    ArmReadTraps(untrapped, lower - untrapped);
+                }
+                untrapped = (std::max)(untrapped, upper);
             }
         });
-        if (queued < size) {
-            ArmReadTraps(device_addr, size);
+        if (trap_preflushed) {
+            if (queued < size) {
+                ArmReadTraps(device_addr, size);
+            }
+        } else if (untrapped < end) {
+            ArmReadTraps(untrapped, end - untrapped);
         }
         if (Nx2DownloadTrace::g_enabled && queued != 0) [[unlikely]] {
             Nx2DownloadTrace::Queued(device_addr, size, queued);

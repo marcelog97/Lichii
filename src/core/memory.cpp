@@ -6,6 +6,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <atomic>
+#include <chrono>
 #include <algorithm>
 #include <cstdint>
 #include <cstring>
@@ -498,6 +499,14 @@ struct Memory::Impl {
         if (vaddr == 0 || !AddressSpaceContains(*current_page_table, vaddr, size)) {
             return;
         }
+        if (TrapStatsEnabled()) [[unlikely]] {
+            const u64 pages = ((vaddr + size - 1) >> YUZU_PAGEBITS) - (vaddr >> YUZU_PAGEBITS) + 1;
+            (cached ? Stats().cache_calls : Stats().uncache_calls)
+                .fetch_add(1, std::memory_order_relaxed);
+            (cached ? Stats().cache_pages : Stats().uncache_pages)
+                .fetch_add(pages, std::memory_order_relaxed);
+            MaybeReportTrapStats();
+        }
 
         if (current_page_table->fastmem_arena) {
             Common::MemoryPermission perm{};
@@ -594,9 +603,54 @@ struct Memory::Impl {
                Settings::values.cpu_backend.GetValue() != Settings::CpuBackend::Nce;
     }
 
+    /// EDEN_NX2_TRAP_STATS=1: every 10 s, log how many read traps were armed (calls, pages,
+    /// protect calls) and how many pages a guest read disarmed.
+    struct TrapStats {
+        std::atomic<u64> arm_calls{}, armed_pages{}, protects{}, disarmed_pages{};
+        std::atomic<u64> cache_calls{}, cache_pages{}, uncache_calls{}, uncache_pages{};
+        std::atomic<u64> slow_writes{};
+        std::atomic<s64> last_ns{};
+    };
+    static TrapStats& Stats() {
+        static TrapStats stats;
+        return stats;
+    }
+    static bool TrapStatsEnabled() {
+        static const bool enabled = std::getenv("EDEN_NX2_TRAP_STATS") != nullptr;
+        return enabled;
+    }
+    static void MaybeReportTrapStats() {
+        auto& stats = Stats();
+        const s64 now = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                            std::chrono::steady_clock::now().time_since_epoch())
+                            .count();
+        s64 last = stats.last_ns.load(std::memory_order_relaxed);
+        if (last == 0) {
+            stats.last_ns.compare_exchange_strong(last, now, std::memory_order_relaxed);
+            return;
+        }
+        if (now - last < 10'000'000'000 ||
+            !stats.last_ns.compare_exchange_strong(last, now, std::memory_order_relaxed)) {
+            return;
+        }
+        LOG_INFO(HW_Memory,
+                 "Read traps in 10 s: {} arm calls, {} pages armed in {} protects, {} pages "
+                 "disarmed by guest reads; cached marks {} calls ({} pages), uncached {} calls "
+                 "({} pages), {} slow-path guest writes",
+                 stats.arm_calls.exchange(0), stats.armed_pages.exchange(0),
+                 stats.protects.exchange(0), stats.disarmed_pages.exchange(0),
+                 stats.cache_calls.exchange(0), stats.cache_pages.exchange(0),
+                 stats.uncache_calls.exchange(0), stats.uncache_pages.exchange(0),
+                 stats.slow_writes.exchange(0));
+    }
+
     void RasterizerArmReadTraps(u64 vaddr, u64 size) {
         // Clean cached read areas also need invalidation when reactive flushing is enabled.
         read_trap_generation.fetch_add(1, std::memory_order_release);
+        if (TrapStatsEnabled()) [[unlikely]] {
+            Stats().arm_calls.fetch_add(1, std::memory_order_relaxed);
+            MaybeReportTrapStats();
+        }
         if (vaddr == 0 || size == 0 || !AddressSpaceContains(*current_page_table, vaddr, size) ||
             !ReadTrapsEnabled()) {
             return;
@@ -611,6 +665,10 @@ struct Memory::Impl {
                 read_trap_generation.fetch_add(1, std::memory_order_release);
                 host_buffer->Protect(run_begin << YUZU_PAGEBITS, run_pages << YUZU_PAGEBITS,
                                      Common::MemoryPermission{});
+                if (TrapStatsEnabled()) [[unlikely]] {
+                    Stats().protects.fetch_add(1, std::memory_order_relaxed);
+                    Stats().armed_pages.fetch_add(run_pages, std::memory_order_relaxed);
+                }
                 run_pages = 0;
             }
         };
@@ -665,6 +723,9 @@ struct Memory::Impl {
             // Still cached (this read came through the rasterizer path): writes stay trapped.
             host_buffer->Protect(*it << YUZU_PAGEBITS, YUZU_PAGESIZE,
                                  Common::MemoryPermission::Read);
+            if (TrapStatsEnabled()) [[unlikely]] {
+                Stats().disarmed_pages.fetch_add(1, std::memory_order_relaxed);
+            }
             it = armed_read_traps.erase(it);
             armed_read_trap_count.fetch_sub(1, std::memory_order_relaxed);
         }
@@ -922,6 +983,9 @@ struct Memory::Impl {
     }
 
     void HandleRasterizerWrite(VAddr v_address, size_t size) {
+        if (TrapStatsEnabled()) [[unlikely]] {
+            Stats().slow_writes.fetch_add(1, std::memory_order_relaxed);
+        }
         const auto* p = GetPointerImpl(
             v_address, []() {}, []() {});
         constexpr size_t sys_core = Core::Hardware::NUM_CPU_CORES - 1;
