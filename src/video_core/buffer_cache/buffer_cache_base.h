@@ -446,6 +446,8 @@ public:
     bool any_buffer_uploaded = false;
     /// Indirectly read banks of native programs already uploaded this frame.
     std::unordered_set<DAddr> native_indirect_uniforms_this_frame;
+    /// Native bank pages: the frame they were last uploaded again (RefreshNativeBank).
+    std::unordered_map<DAddr, u64> native_bank_refreshes;
 
 private:
     template <typename Func>
@@ -491,6 +493,12 @@ private:
     void BindHostGraphicsUniformBuffers(size_t stage);
 
     void BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32 binding_index, bool needs_bind);
+
+    /// Frames between uploads of a native 64 KiB bank page again (0 = never).
+    [[nodiscard]] u64 NativeBankRefreshInterval() const;
+
+    /// Uploads the bank pages due for another upload straight into the host buffer.
+    void RefreshNativeBank(Buffer& buffer, DAddr device_addr, u64 size);
 
     void BindHostGraphicsStorageBuffers(size_t stage);
 

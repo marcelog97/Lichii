@@ -1327,6 +1327,71 @@ void BufferCache<P>::BindHostGraphicsUniformBuffers(size_t stage) {
 }
 
 template <class P>
+u64 BufferCache<P>::NativeBankRefreshInterval() const {
+    // Every frame uploaded ~9.5 MB of Ocarina's 64 KiB banks again (~360 MB/s at the Kokiri
+    // autosave, regions bound by several banks two or three times a frame), and taking the pages
+    // out of tracking and back cost ~70,000 page protections a second: 37.7 -> 40.0 FPS without
+    // it, dialogue boxes and HUD unchanged. Ocarina refreshes a bank page every 30 frames;
+    // EDEN_NX2_BANK_REUPLOAD=<frames> sets the interval for any title (1 = every frame, 0 = off).
+    static const int forced = [] {
+        const char* value = std::getenv("EDEN_NX2_BANK_REUPLOAD");
+        return value == nullptr ? -1 : std::atoi(value);
+    }();
+    if (forced >= 0) {
+        return static_cast<u64>(forced);
+    }
+    return Tegra::g_nx2_program_id.load(std::memory_order_relaxed) ==
+                   Tegra::OcarinaOfTimeProgramId
+               ? 30
+               : 1;
+}
+
+template <class P>
+void BufferCache<P>::RefreshNativeBank(Buffer& buffer, DAddr device_addr, u64 size) {
+    // Uploads the bank's bytes straight into the host buffer (no tracking change, so no page
+    // protections). With an interval above one frame, per page, so banks that overlap upload
+    // each page once per interval; contiguous due pages go out as one copy.
+    const u64 interval = NativeBankRefreshInterval();
+    if (interval > 1 && native_bank_refreshes.size() > 1'000'000) {
+        native_bank_refreshes.clear();
+    }
+    boost::container::small_vector<BufferCopy, 16> copies;
+    u64 total_size = 0;
+    u64 largest_copy = 0;
+    const DAddr end = device_addr + size;
+    for (DAddr page = Common::AlignDown(device_addr, Core::DEVICE_PAGESIZE); page < end;
+         page += Core::DEVICE_PAGESIZE) {
+        if (interval > 1) {
+            const auto [it, inserted] = native_bank_refreshes.try_emplace(page, frame_tick);
+            if (!inserted) {
+                if (frame_tick - it->second < interval) {
+                    continue;
+                }
+                it->second = frame_tick;
+            }
+        }
+        const DAddr begin = (std::max)(page, device_addr);
+        const DAddr stop = (std::min)(page + Core::DEVICE_PAGESIZE, end);
+        const u64 length = stop - begin;
+        if (!copies.empty() &&
+            copies.back().dst_offset + copies.back().size == buffer.Offset(begin)) {
+            copies.back().size += length;
+        } else {
+            copies.push_back(BufferCopy{
+                .src_offset = total_size,
+                .dst_offset = buffer.Offset(begin),
+                .size = length,
+            });
+        }
+        total_size += length;
+        largest_copy = (std::max)(largest_copy, copies.back().size);
+    }
+    if (total_size != 0) {
+        UploadMemory(buffer, total_size, largest_copy, std::span<BufferCopy>(copies.data(), copies.size()));
+    }
+}
+
+template <class P>
 void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32 binding_index, bool needs_bind) {
     ++channel_state->uniform_cache_shots[0];
     // Bank 24 (root table 0, NVN2's push constants) is read from bank 17, which such games do not
@@ -1369,13 +1434,9 @@ void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32 
     }();
     // Native programs keep tables next to their code in a 64 KiB bank read with indirect offsets
     // (Splatoon Raiders: the dialogue box corners in c1). Writes to that memory can go unnoticed by
-    // the memory tracker, leaving stale host contents, so upload such a bank again once per frame.
-    // EDEN_NX2_BANK_REUPLOAD=0 (experiment): never upload them again.
-    static const bool bank_reupload = [] {
-        const char* value = std::getenv("EDEN_NX2_BANK_REUPLOAD");
-        return value == nullptr || value[0] != '0';
-    }();
-    if (bank_reupload && has_host_buffer &&
+    // the memory tracker, leaving stale host contents, so upload such a bank again once per frame
+    // (or interval, NativeBankRefreshInterval).
+    if (NativeBankRefreshInterval() != 0 && has_host_buffer &&
         (*channel_state->uniform_buffer_sizes)[stage][index] == 0x10000 &&
         size != 0 && gpu_memory != nullptr && gpu_memory->UsesNativeTiling() &&
         (Nx2Perf::Verify() || !native_indirect_uniforms_this_frame.contains(device_addr)) &&
@@ -1389,12 +1450,7 @@ void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32 
         }
         const u64 upload_size = (std::min<u64>)(mapped_size, size);
         if (upload_size != 0) {
-            std::array<BufferCopy, 1> copies{BufferCopy{
-                .src_offset = 0,
-                .dst_offset = buffer.Offset(device_addr),
-                .size = upload_size,
-            }};
-            UploadMemory(buffer, upload_size, upload_size, copies);
+            RefreshNativeBank(buffer, device_addr, upload_size);
         }
     }
     const bool use_fast_buffer = needs_alignment_stream
