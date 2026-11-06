@@ -18,6 +18,7 @@
 
 #include <fmt/format.h>
 
+#include "video_core/nx2.h"
 #include "video_core/renderer_vulkan/vk_query_cache.h"
 
 #include "common/logging.h"
@@ -184,14 +185,20 @@ bool Scheduler::DeferFlush() {
     // Imprisonment fights, each a queue submission (~22,000 a second with the others), which
     // kept the Vulkan worker busy submitting. Batched within 500 us: ~10-15% more fps there.
     // Command list copies after dispatches were ~9,000 more a second, of which the front waited
-    // for about 5%.
-    static const s64 interval_us = [] {
+    // for about 5%. Ocarina submits every millisecond: its front waits ~120 times a second for
+    // command lists the GPU writes, each until the host GPU ran the whole batch holding the copy
+    // (A/B, three runs each: 39.6 FPS at 5 ms, 40.5 at 1 ms, 39.9 at 500 us before deferred work
+    // was submitted ahead of fence waits). EDEN_NX2_FENCE_FLUSH_US sets it
+    // for any title.
+    static const s64 forced_us = [] {
         const char* value = std::getenv("EDEN_NX2_FENCE_FLUSH_US");
-        if (value != nullptr) {
-            return static_cast<s64>(std::atoll(value));
-        }
-        return s64{500};
+        return value != nullptr ? static_cast<s64>(std::atoll(value)) : s64{-1};
     }();
+    const s64 interval_us = forced_us >= 0 ? forced_us
+                            : Tegra::g_nx2_program_id.load(std::memory_order_relaxed) ==
+                                      Tegra::OcarinaOfTimeProgramId
+                                ? s64{1000}
+                                : s64{500};
     if (interval_us <= 0 || !VideoCommon::GpuSplit::OnBackThread() ||
         std::chrono::steady_clock::now() - last_flush >= std::chrono::microseconds{interval_us}) {
         return false;
