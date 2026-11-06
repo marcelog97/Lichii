@@ -17,6 +17,12 @@ constexpr bool CanDiscardPendingDraw(bool native, bool depth_enabled, u32 index_
     if (native && !discard_native) {
         return false;
     }
+    // Opted-in native draws: only depth-tested ones (the 3D scene, redrawn every frame). With the
+    // element-count rule Ocarina's minimap stayed blank for minutes: it is drawn once into a
+    // texture without depth, and the skipped draw was never repeated until the next room.
+    if (native) {
+        return depth_enabled;
+    }
     // Preserve the legacy async-shader heuristic.
     return depth_enabled || (index_count > 6 && vertex_count > 6);
 }
