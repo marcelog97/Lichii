@@ -53,6 +53,8 @@
 #endif // ^^^ POSIX ^^^
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <mutex>
@@ -992,9 +994,52 @@ void HostMemory::Protect(size_t virtual_offset, size_t length, MemoryPermission 
 #endif
 }
 
+namespace {
+// Marking memory cold takes its pages out of the working set, and touching them again costs a page
+// fault each. With memory to spare that only makes hitches: in Ocarina (2026-11-06) the frames
+// over 100 ms carried 15,000-133,000 page faults against ~40 in a normal frame, 4-5 us each, up
+// to 0.5 s. So hint only while the host is really short of memory: by default while less than
+// 2 GiB of physical memory is available (Windows trims working sets only near exhaustion; the
+// emulator itself holds ~10 GB), checked at most once a second. EDEN_NX2_HINT_COLD=1 always
+// hints, =0 never.
+bool HintColdAllowed() {
+    static const int forced = [] {
+        const char* value = std::getenv("EDEN_NX2_HINT_COLD");
+        return value == nullptr ? -1 : (value[0] == '1' ? 1 : 0);
+    }();
+    if (forced >= 0) {
+        return forced == 1;
+    }
+#ifdef _WIN32
+    static std::atomic<long long> checked_at_ms{-1};
+    static std::atomic<bool> allowed{true};
+    const long long now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                 std::chrono::steady_clock::now().time_since_epoch())
+                                 .count();
+    const long long last = checked_at_ms.load(std::memory_order_relaxed);
+    if (last < 0 || now_ms - last >= 1000) {
+        checked_at_ms.store(now_ms, std::memory_order_relaxed);
+        MEMORYSTATUSEX status{};
+        status.dwLength = sizeof(status);
+        if (GlobalMemoryStatusEx(&status)) {
+            const bool short_of_memory = status.ullAvailPhys < (2ULL << 30);
+            if (allowed.exchange(short_of_memory, std::memory_order_relaxed) != short_of_memory ||
+                last < 0) {
+                LOG_INFO(Common_Memory, "Cold memory hints {}: {} MiB of physical memory available",
+                         short_of_memory ? "on" : "off", status.ullAvailPhys >> 20);
+            }
+        }
+    }
+    return allowed.load(std::memory_order_relaxed);
+#else
+    return true;
+#endif
+}
+} // Anonymous namespace
+
 void HostMemory::HintCold(size_t physical_offset, size_t length,
                           std::optional<size_t> virtual_offset) const {
-    if (length == 0 || backing_base == nullptr) {
+    if (length == 0 || backing_base == nullptr || !HintColdAllowed()) {
         return;
     }
     const auto hint = [length](u8* address) {
