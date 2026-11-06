@@ -33,6 +33,7 @@
 #include "video_core/engines/kepler_compute.h"
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/memory_manager.h"
+#include "video_core/nx2.h"
 #include "video_core/nx2_perf.h"
 #include "video_core/pipeline_cache_files.h"
 #include "video_core/renderer_vulkan/async_draw_policy.h"
@@ -716,13 +717,39 @@ std::unordered_map<u64, u8> LoadUsedPipelines(const std::filesystem::path& path,
 // boot that ran out of memory never saved one and the next boot did the same.
 constexpr size_t MaxPipelinesWithoutUsedList = 3000;
 
-// EDEN_NX2_PRELOAD_ALL_PIPELINES=1 builds every cached pipeline at boot, as before.
-bool PreloadAllPipelines() {
-    static const bool all = [] {
+// Builds every cached pipeline at boot instead of only the used list. Ocarina does: with the used
+// list from an older cache version it skipped 728 of 883 and built 475 during play, on the GPU
+// thread, while building all 1,819 at boot took 0.3 s longer to reach the title screen.
+// EDEN_NX2_PRELOAD_ALL_PIPELINES=1/0 forces it for any title. The title id comes from the caller:
+// at boot the game has not opened the GPU yet, so g_nx2_program_id is still 0.
+bool PreloadAllPipelines(u64 title_id) {
+    static const int forced = [] {
         const char* value = std::getenv("EDEN_NX2_PRELOAD_ALL_PIPELINES");
-        return value != nullptr && value[0] == '1';
+        return value == nullptr ? -1 : (value[0] == '1' ? 1 : 0);
     }();
-    return all;
+    if (forced >= 0) {
+        return forced == 1;
+    }
+    return title_id == Tegra::OcarinaOfTimeProgramId;
+}
+
+// Frames a graphics pipeline may go unused before it is destroyed (0 = never). Ocarina keeps all:
+// returning to an area rebuilt the evicted ones in bursts of 100-400 on the GPU thread, each a
+// shader translation (median 4.9 ms) plus the driver build, which made 48 of the 51 hitches over
+// 70 ms of a 25-minute session (2026-11-06). Keeping them cost ~0.7-1.1 GB more private memory
+// and ~0.5-0.9 GB more VRAM there. EDEN_NX2_PIPELINE_EVICT_FRAMES=<frames> sets it for any title.
+u64 PipelineEvictFrames() {
+    static const s64 forced = [] {
+        const char* value = std::getenv("EDEN_NX2_PIPELINE_EVICT_FRAMES");
+        return value == nullptr ? s64{-1} : static_cast<s64>(std::atoll(value));
+    }();
+    if (forced >= 0) {
+        return static_cast<u64>(forced);
+    }
+    return Tegra::g_nx2_program_id.load(std::memory_order_relaxed) ==
+                   Tegra::OcarinaOfTimeProgramId
+               ? 0
+               : 9000;
 }
 } // Anonymous namespace
 
@@ -945,7 +972,7 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
         if (!disk_pipelines.insert(hash).second) {
             return;
         }
-        if (!PreloadAllPipelines() &&
+        if (!PreloadAllPipelines(title_id) &&
             (used_pipelines.empty() ? queued_graphics >= MaxPipelinesWithoutUsedList
                                     : !used_pipelines.contains(hash))) {
             ++skipped_pipelines;
@@ -1161,12 +1188,14 @@ void PipelineCache::EvictUnusedPipelines() {
     }
     // Each built pipeline holds ~0.45 MB of driver memory and none was ever destroyed, so it grew
     // with every place a session went (title 1: 1,500 on its title screen alone). One unused for
-    // this long is destroyed; it takes 2-3 ms to build again from the driver's pipeline cache.
-    constexpr u64 EvictAfterFrames = 9000;
-    if (frame_count <= EvictAfterFrames) {
+    // this long is destroyed. Building it again takes a shader translation on the GPU thread
+    // (median 4.9 ms on Ocarina) plus a driver build, 2-3 ms when the driver's cache hits
+    // (PipelineEvictFrames: how long, or never).
+    const u64 evict_after = PipelineEvictFrames();
+    if (evict_after == 0 || frame_count <= evict_after) {
         return;
     }
-    const u64 cutoff = frame_count - EvictAfterFrames;
+    const u64 cutoff = frame_count - evict_after;
     const u64 tick = scheduler.CurrentTick();
     size_t evicted = 0;
     for (auto it = graphics_cache.begin(); it != graphics_cache.end();) {
@@ -1192,7 +1221,7 @@ void PipelineCache::EvictUnusedPipelines() {
         }
     }
     LOG_INFO(Render_Vulkan, "Evicted {} graphics pipelines unused for {} frames, {} left", evicted,
-             EvictAfterFrames, graphics_cache.size());
+             evict_after, graphics_cache.size());
 }
 
 GraphicsPipeline* PipelineCache::BuiltPipeline(GraphicsPipeline* pipeline) const noexcept {
