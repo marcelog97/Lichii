@@ -7,6 +7,7 @@
 #pragma once
 
 #include <algorithm>
+#include <chrono>
 #include <condition_variable>
 #include <cstdlib>
 #include <cstring>
@@ -85,7 +86,7 @@ public:
         if constexpr (!can_async_check) {
             TryReleasePendingFences<false>();
         }
-        auto [should_flush, committed_flushes] = CommitCacheFlushes();
+        auto [should_flush, committed_flushes] = CommitCacheFlushes(delay_fence);
         if (!delay_fence && committed_flushes == 0 && SkipEmptyFence()) {
             Nx2Profile::Scope skipped_scope{Nx2Profile::Zone::FenceSkipped};
             func();
@@ -342,7 +343,7 @@ private:
     /// lock is taken once, alone, and the fencing thread later takes only the lock of the cache
     /// with work, instead of holding both while it copies (the GPU thread's draws and uploads
     /// waited for it).
-    CacheFlushes CommitCacheFlushes() {
+    CacheFlushes CommitCacheFlushes(bool delay_fence) {
         CacheFlushes flushes{};
         {
             std::scoped_lock lock{texture_cache.mutex};
@@ -354,7 +355,7 @@ private:
         }
         {
             std::scoped_lock lock{buffer_cache.mutex};
-            if (buffer_cache.HasUncommittedFlushes()) {
+            if (buffer_cache.HasUncommittedFlushes() && CommitBufferDownloadsNow(delay_fence)) {
                 buffer_cache.CommitAsyncFlushes();
                 flushes.should_flush = true;
                 flushes.committed |= BufferFlushes;
@@ -391,6 +392,31 @@ private:
     std::deque<std::deque<std::function<void()>>> pending_operations;
     std::deque<u8> pending_flushes; ///< Per fence: the caches that committed downloads
     u32 skipped_fences{}; ///< Empty fences skipped since the last one made (GPU thread only)
+
+    /// Whether this fence takes the buffer downloads queued since the last one that did. With
+    /// fast GPU fences the guest sees a fence's operation when it is signalled, before the host
+    /// GPU runs the work and before its downloads land, so downloading for every fence only
+    /// makes the copies younger: Ocarina signals ~230 fences a frame and each copied the same
+    /// preflushed pages back again (~1 GB/s). EDEN_NX2_DOWNLOAD_BATCH_US=<us>: with fast fences,
+    /// commit downloads at most once per interval; the ranges written meanwhile merge.
+    bool CommitBufferDownloadsNow(bool delay_fence) {
+        static const s64 interval_ns = [] {
+            const char* value = std::getenv("EDEN_NX2_DOWNLOAD_BATCH_US");
+            return value == nullptr ? s64{0} : s64{std::atoll(value)} * 1000;
+        }();
+        if (delay_fence || interval_ns <= 0) {
+            return true;
+        }
+        const s64 now = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                            std::chrono::steady_clock::now().time_since_epoch())
+                            .count();
+        if (now - last_buffer_commit_ns < interval_ns) {
+            return false;
+        }
+        last_buffer_commit_ns = now;
+        return true;
+    }
+    s64 last_buffer_commit_ns{}; ///< GPU thread only
 
     std::mutex guard;
     std::mutex ring_guard;
