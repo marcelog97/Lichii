@@ -567,6 +567,7 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
             driver_id == VK_DRIVER_ID_QUALCOMM_PROPRIETARY &&
             device.GetDriverVersion() < VK_MAKE_VERSION(512, 672, 0),
         .has_broken_spirv_subgroup_shuffle = driver_id == VK_DRIVER_ID_QUALCOMM_PROPRIETARY,
+        .has_broken_spirv_fragment_shuffle = driver_id == VK_DRIVER_ID_AMD_PROPRIETARY,
         .max_subgroup_size = device.GetMaxSubgroupSize(),
         .has_broken_robust =
             device.IsNvidia() && device.GetNvidiaArch() <= NvidiaArchitecture::Arch_Pascal,
@@ -1246,16 +1247,19 @@ void PipelineCache::EvictUnusedPipelines() {
              evict_after, graphics_cache.size());
 }
 
+/// Returns `pipeline` when it is built or the current draw must wait for it, and nullptr when the
+/// draw may be skipped while it builds (asynchronous shaders; native draws only with
+/// EDEN_NX2_ASYNC_DISCARD=1). Each nullptr returned for an unbuilt pipeline is counted for the log.
 GraphicsPipeline* PipelineCache::BuiltPipeline(GraphicsPipeline* pipeline) const noexcept {
     if (pipeline->IsBuilt()) {
         return pipeline;
     }
-    // EDEN_NX2_ASYNC_DISCARD=1 (from zortos293/Lichii#224): a native draw whose pipeline is still
-    // building may be skipped instead of stalling the frame, under the legacy async heuristic and
-    // without the async-shaders setting. A new pipeline first gets EDEN_NX2_ASYNC_GRACE_MS
-    // (default 12) to finish, once, so a driver-cache hit (2-9 ms) never skips; first-time driver
-    // compiles (0.1-2.6 s on Ocarina, ~0.6 s on average) do. Pipelines that write storage memory
-    // and mesh pipelines always wait: what they produce can persist.
+    // EDEN_NX2_ASYNC_DISCARD=1 (zortos293/Lichii#224): a native draw whose pipeline is still
+    // building may be skipped instead of stalling the frame. Local additions: it works without the
+    // async-shaders setting; a new pipeline first gets EDEN_NX2_ASYNC_GRACE_MS (default 12) to
+    // finish, once, so a driver-cache hit (2-9 ms) never skips and only first-time driver compiles
+    // (0.1-2.6 s on Ocarina, ~0.6 s on average) do; pipelines that write storage memory and mesh
+    // pipelines always wait; and native draws skip only when depth-tested (async_draw_policy.h).
     static const bool discard_native = [] {
         const char* value = std::getenv("EDEN_NX2_ASYNC_DISCARD");
         const bool enabled = value != nullptr && value[0] == '1';
@@ -1286,8 +1290,9 @@ GraphicsPipeline* PipelineCache::BuiltPipeline(GraphicsPipeline* pipeline) const
     if (discard) {
         static std::atomic<u64> skipped{};
         if ((skipped.fetch_add(1, std::memory_order_relaxed) & 255) == 0) {
-            // Counts lookups, not draws: a draw can look its pipeline up more than once.
-            LOG_INFO(Render_Vulkan, "Async shaders: {} pipeline lookups skipped for unbuilt pipelines",
+            // Counts lookups, not draws: a draw state can look its pipeline up more than once.
+            LOG_INFO(Render_Vulkan,
+                     "Async shaders: {} pipeline lookups skipped for unbuilt pipelines",
                      skipped.load(std::memory_order_relaxed));
         }
     }
